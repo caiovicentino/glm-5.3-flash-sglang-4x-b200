@@ -39,3 +39,36 @@
 
 10. **`reasoning_effort` defaults to `max`** in the checkpoint's template: 6–8k reasoning tokens on an
     essay prompt, coherent and without repetition, just long. Send `high` or `low` from the client.
+
+---
+
+## Added 2026-09-19, after 8 days of continuous production
+
+8. **`MEMF 0.85` + `chunk 8192` is not safe once you raise the context.** On 2026-09-14 01:25 UTC the
+   engine died on all four ranks: `fp8_mqa_logits` asked for **9.25 GiB** with **8.5 GiB free**. The DSA
+   indexer buffer is **`chunked_prefill_size × context_length × 4 bytes`** — the 9.25 GiB reconstructs
+   exactly as `8192 × ~303k × 4`. It is linear in *both* factors, and it comes out of the memory
+   **`--mem-fraction-static` leaves free**, not out of the KV pool. So context length and prefill chunk
+   compete for the same bytes: with `ctx 524288`, chunk 4096 costs 8 GiB and chunk 8192 costs 16 GiB.
+   The README used to say "the checkpoint supports more; the pool has room" about context — that advice
+   was wrong, and this is the correction. Defaults here are now `MEMF 0.75`, `chunk 4096`.
+
+9. **EP4 is worth it, but it eats the memory headroom.** Adding `--ep-size 4` and doubling context to
+   524288 (2026-09-18 23:16 UTC) left **176 MiB free per card** and produced **11 request-level
+   `torch.OutOfMemoryError`** (`Tried to allocate 214.00 MiB`) over 83 minutes. The server did **not**
+   die — the KV pool never filled and nothing was retracted; transient buffers simply had nowhere to go.
+   Fix: `MEMF 0.80 → 0.75`, which restored ~21 GiB free and stopped the OOMs dead (**0 in the following
+   13 hours**).
+
+   The trap worth naming: **lowering the CUDA-graph ceiling does not fix this.** Graphs come out of the
+   same static budget as the KV pool (incident 7), so cutting them returns *pool*, not *free memory*.
+   Only `--mem-fraction-static` controls what stays free. We dropped graphs 96 → 60 anyway, for a
+   different reason: to win back the pool that the lower MEMF costs. It covers the real traffic — the
+   largest batch seen under EP4 is 41, and in 115k historical decode samples the 49–64 bucket is 0.3%
+   with nothing above 64. Batches above 60 are still *accepted* (`--max-running-requests 96`); they just
+   run without a captured graph.
+
+10. **EP disables shared-experts fusion.** The log says so plainly:
+    `Shared experts fusion is not supported together with expert parallelism yet`. The model has 1 shared
+    expert alongside the 288 routed ones, so this is a real optimisation traded away. The throughput
+    below says the trade is worth taking, but it is a trade, not a free win.

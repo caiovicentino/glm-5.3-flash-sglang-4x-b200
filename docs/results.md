@@ -63,3 +63,33 @@ decode in the log at that point: 320–330 tok/s with acceptance 3.8–3.9 (code
 `reasoning_effort: max`, H3 (shapes image) is a strict string match rejecting a correct answer, and G
 (cached tokens) passes once `--enable-cache-report` is on (99 % cached on a repeated 8k system prompt).
 Tool calling, thinking on/off, the two other vision gates and 8-stream concurrency pass.
+
+---
+
+## Phase 5 — EP4 in production, 2026-09-18/19
+
+Not a `bench/` run. These come from the server's own `Decode batch` log lines over real traffic,
+bucketed by `#running-req`, extracted with the same parser on both logs. Config before: TP4, EP1,
+ctx 262144, MEMF 0.80, graphs 96. After: TP4, **EP4**, ctx **524288**, MEMF **0.75**, graphs 60,
+chunk 4096 on both.
+
+| batch | TP4/EP1 · 115,343 samples · 4.4 days | TP4/EP4 · 39,411 samples · 13 h | delta |
+|---|---|---|---|
+| 1 | 291 tok/s (p90 454) · accept 3.16 | 412 (p90 562) · 4.19 | +42% |
+| 2–4 | 608 (838) · 2.80 | 701 (1,004) · 2.85 | +15% |
+| 5–8 | 941 (1,260) · 2.79 | 1,133 (1,566) · 2.81 | +20% |
+| 9–16 | 1,275 (1,767) · 2.79 | 1,665 (2,380) · 2.89 | +31% |
+| 17–32 | 1,783 (2,559) · 2.82 | 1,999 (3,014) · 2.90 | +12% |
+| 33–48 | 2,185 (3,248) · 2.73 | 2,712 (4,454) · 2.80 | +24% |
+| 49–64 | 2,696 (4,051) · 2.44 | — (no samples yet) | — |
+
+Prefill, full chunks only (partial chunks report inflated numbers because cached tokens count as
+computed): **~20,880 tok/s** before. Prefix-cache hit rate 95.5% before, **95.3%** after.
+
+Health over the 13 h after the MEMF fix: **0 OOM, 0 context-length rejections, 0 retracted requests**,
+queue empty, 10 GiB free per card steady.
+
+Reading: the gain is real and shows in every bucket, but it is measured on production traffic across
+different days, so treat the well-sampled middle of the table as the result and the edges as
+directional. The honest summary is **+12% to +31% where the data is thick**, plus a context limit that
+stopped rejecting real work.

@@ -25,15 +25,48 @@ batch bucket (`serve/adaptive_spec.json`): the stock adaptive policy switches dr
 | checkpoint | [`RadixArk/GLM-5.3-Flash-NVFP4`](https://huggingface.co/RadixArk/GLM-5.3-Flash-NVFP4) (190 GB, ModelOpt 0.46, the one the SGLang cookbook uses): routed experts + MLP NVFP4 g16, attention / router gates / embeddings / lm_head / vision tower / MTP layer BF16 |
 | patches | **none** — the cookbook checkpoint loads on the stock image. The 0xSero loader patches that the 2× B200 recipe needs break the import on this newer build and are not required |
 | chat template | the checkpoint's own (`emit_image` macro present, vision works out of the box) |
-| parallelism | `--tp-size 4` |
+| parallelism | `--tp-size 4 --ep-size 4` — **EP4 added 2026-09-18**; the SGLang cookbook recipe uses it and we had been running TP-only with 288 experts. See "Update" below |
 | attention | `--dsa-prefill-backend trtllm --dsa-decode-backend trtllm --kv-cache-dtype fp8_e4m3` (the Blackwell pair from the cookbook); vision tower on `fa4` (auto) |
 | MoE | `--moe-runner-backend flashinfer_cutlass` with `--quantization modelopt_fp4` |
 | speculation | `--speculative-algorithm EAGLE --speculative-num-steps 5 --speculative-eagle-topk 1 --speculative-num-draft-tokens 6 --speculative-adaptive`, config `serve/adaptive_spec.json`: 5 steps at batch 1, 3 at batch ≥ 2, 2 at batch ≥ 40 |
-| memory | `--mem-fraction-static 0.85` → KV pool **9.8 M tokens** with graphs up to batch 32, **7.2 M** with graphs up to 128 (the extra graphs cost ~2.6 M tokens of pool); 173–181 GB per card in use |
-| prefill | `--chunked-prefill-size 8192 --max-prefill-tokens 8192` |
-| concurrency | `CONC=128`: `--max-running-requests 128 --cuda-graph-max-bs-decode 128` (the scheduler settles at 122 effective slots) |
-| context | `--context-length 262144` (the checkpoint supports more; the pool has room) |
+| memory | `--mem-fraction-static 0.75` → KV pool **6.3 M tokens**, ~21 GiB free per card. **Do not raise this with a long context** — the DSA indexer buffer is `chunk × ctx × 4B` and comes out of the free memory, not the pool (incidents 8 and 9) |
+| prefill | `--chunked-prefill-size 4096 --max-prefill-tokens 4096` — 8192 with a long context is what killed the engine on 09-14 (incident 8) |
+| concurrency | `--max-running-requests 96 --cuda-graph-max-bs-decode 60`. Graphs to 60 cover the real traffic (largest batch seen: 41); larger batches are still accepted, they just run ungraphed |
+| context | `--context-length 524288`. Raised 2026-09-18 because production was **rejecting real requests** at 373k–390k tokens. It is not free: the indexer buffer scales with it (incident 8) |
 | client | OpenAI-compatible on :8000, `--reasoning-parser glm45 --tool-call-parser glm47`, `--enable-multimodal`, `--enable-cache-report`, `--enable-metrics` |
+
+## Update 2026-09-18/19 — EP4, 524k context, and the memory that pays for both
+
+Eight days of continuous production later, three things changed. All of them came from running the
+thing, not from benchmarking it.
+
+**Expert parallelism was missing.** We served 288 routed experts with `--tp-size 4` and no `--ep-size`,
+while the SGLang cookbook recipe for this model uses TP4/**EP4**. Adding it moved every batch bucket:
+
+| batch | TP4/EP1 (115k decode samples, 4.4 days) | **TP4/EP4 (39k samples, 13 h)** | delta |
+|---|---|---|---|
+| 1 | 291 tok/s · accept 3.16 | **412** · **4.19** | +42% |
+| 2–4 | 608 · 2.80 | **701** · 2.85 | +15% |
+| 5–8 | 941 · 2.79 | **1,133** · 2.81 | +20% |
+| 9–16 | 1,275 · 2.79 | **1,665** · 2.89 | **+31%** |
+| 17–32 | 1,783 · 2.82 | **1,999** · 2.90 | +12% |
+| 33–48 | 2,185 · 2.73 | **2,712** · 2.80 | +24% |
+
+**Read these with the caveats.** This is *production traffic*, not the controlled `bench/` runs that
+produced the rest of this repo: the two columns are different days with different prompt mixes, and the
+outer buckets are thin (83 samples at batch 1, 145 at 33–48). The two well-sampled buckets — 9–16 with
+20,826 measurements and 17–32 with 12,487 — are the ones to trust, and they show +31% and +12%.
+Acceptance also rose in every bucket, which we cannot explain: EP does not change the drafter's maths.
+It may be a second-order effect of the lower graph ceiling changing which adaptive configuration gets
+picked, or simply different content. We are reporting it, not claiming it.
+
+**Context doubled, because production was rejecting work.** 262144 was turning away real requests at
+373k–390k tokens. 524288 fixed that (**0 rejections in 13 h**), and the KV pool still holds 6.3 M tokens.
+
+**And both had to be paid for.** EP4 plus the longer context left 176 MiB free per card and started
+throwing request-level OOMs. `MEMF 0.75` bought the headroom back. Prefix-cache hit rate came back to
+**95.3%** (it was 95.5% before), so the 9% smaller pool cost essentially nothing. Full story in
+incidents 8, 9 and 10.
 
 ## Quick start
 

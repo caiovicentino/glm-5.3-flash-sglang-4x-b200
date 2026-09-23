@@ -1,4 +1,10 @@
-# Results — 4× B200 TP4, 2026-09-11 (14:00–18:30 UTC−3) and 2026-09-12
+# Results — 4× B200
+
+Phases 1–5: controlled runs and the first production days (2026-09-11 → 19). Phases 6–7: the production eval
+of v2 and the v3 trial (2026-09-22 → 23), measured from real traffic with `tools/log_eval.py` and
+`tools/metrics_summary.py`.
+
+## Phases 1–5 — 4× B200 TP4, 2026-09-11 (14:00–18:30 UTC−3) → 2026-09-19
 
 Server idle between runs; each script run at least twice; numbers are the second (warm) run unless
 stated. Checkpoint `RadixArk/GLM-5.3-Flash-NVFP4`, image `lmsysorg/sglang:glm-5.3-flash` (build
@@ -93,3 +99,73 @@ Reading: the gain is real and shows in every bucket, but it is measured on produ
 different days, so treat the well-sampled middle of the table as the result and the edges as
 directional. The honest summary is **+12% to +31% where the data is thick**, plus a context limit that
 stopped rejecting real work.
+
+## Phase 6 — production eval of v2, 2026-09-19 01:00 → 2026-09-23 04:21 UTC (99.4 h)
+
+Read-only: server logs, `/metrics`, `nvidia-smi`, and a few probe requests. Reproduce with
+`python3 tools/log_eval.py --since "2026-09-19 01:00" --tz -3 <logs>`.
+
+**Traffic.** 80–124k requests/day, 8–10 B prompt tokens/day, 70–117 M generated tokens/day, agentic coding.
+Per request (first 3.6 days, `/metrics`): prompt 88,483 tokens mean (p50 81k, p90 186k, p99 288k), of which
+**3,918 computed** (p50 403, p99 101k) — **95.6% from the prefix cache**; generated 975 mean (p50 311, p99 9,746).
+Concurrency p50 8, p90 21, p99 35, max 96. A queue existed in 18 of 371,931 decode samples.
+
+**Decode per batch bucket.** The machine lives at batch 2–32 (93% of the time):
+
+| batch | share of time | tok/s | per request | acceptance | ms per verify step |
+|---|---|---|---|---|---|
+| 1 | 3.6% | 306 | 306 | 3.39 | 11.1 |
+| 2–4 | 15.9% | 636 | 213 | 2.83 | 13.6 |
+| 5–8 | 22.7% | 1,061 | 168 | 2.81 | 17.0 |
+| 9–16 | 34.4% | 1,569 | 132 | 2.81 | 21.6 |
+| 17–32 | 20.4% | 2,277 | 102 | 2.85 | 28.3 |
+| 33–48 | 2.6% | 2,715 | 76 | 2.71 | 36.0 |
+| 49–64 | 0.0% | 3,203 | 61 | 2.34 | 38.8 |
+| **65–96, no graph** | 0.4% | **964** | **13** | 2.24 | **174.3** |
+
+**It is not bound by bandwidth or power.** At batch 27: ~600 W of 1,000 W per card, clocks at the 1,965 MHz
+maximum, no throttling, SM busy 72%, **memory controller busy 26%**. Step time barely grows from batch 36 to 53
+(36 → 39 ms), so aggregate throughput scales almost linearly up to the knee (~96).
+
+**Latency (first 3.6 days).** TTFT p50 0.71 s, p90 2.38 s, p99 9.98 s. Inter-token latency p50 4.5 ms, p99 135 ms.
+Queue time p99 8.5 s.
+
+**Where it goes:**
+
+- **Cold prefills stall decode for everyone.** With `--prefill-decode-interval 0`, while one request prefills
+  (0.194 s per 4,096-token chunk ≈ 21k tok/s), nobody else decodes and nobody new is admitted. 4,962 bursts/day of
+  ≥ 3 chunks; stall p50 1.2 s, p90 7.2 s, p99 13.2 s, max 25 s; **207 min/day of stalled decode, 817 stalls/day of
+  ≥ 5 s with ≥ 5 users waiting**. ~1,000 requests/day recompute ≥ 100k cold tokens. The worst ones were one
+  ~480k-token session coming back every ~19 minutes and being re-prefilled from scratch.
+- **A TTFT floor in the Python front-end.** "hi" takes 0.525 s on a calm server; a 100k-token cached prompt 0.445 s
+  (size does not matter). With 34 running, the HTTP headers of a trivial request arrive after ~1 s and
+  `/health` takes 1.76 s; the HTTP/tokenizer process sits at 87% of one core. The fix
+  (`--tokenizer-worker-num`) cannot be combined with `--api-key` (incident 15).
+- **The graph cliff above 60** — last row of the table (incident 14).
+- **Both cache pools full.** KV: 1.04 M tokens active, 5.27 M cached, **15 k free** of 6.33 M. KDA state: 112
+  slots active, 404 cached, **3 free** of 519. A session is reusable only while both its KV and a KDA checkpoint
+  survive.
+
+## Phase 7 — v3 in production, 2026-09-23 04:29 → 13:43 UTC
+
+Profile `serve/profiles/v3.env`: graphs to 96, MTP capped at 3 steps, 700 KDA slots, 4 decode rounds between
+prefill chunks. Boot: KV 6,389,760 tokens, KDA verify snapshots 13.26 GB (19.89 in v2), **37.74 GB free after
+graph capture** (36.70 in v2). Nine mandatory smoke tests passed. First 8 hours (04:30 → 12:31, 36k requests):
+
+| | v2 (first 3.6 days) | v3 (8 h) |
+|---|---|---|
+| stalls ≥ 5 s with ≥ 5 users decoding | ~817/day | **0** |
+| inter-token latency p50 / p99 | 4.5 / 135 ms | 7.2 / **54 ms** |
+| per request, batch 9–16 / 17–32 | 132 / 102 tok/s | 139 / 107 tok/s |
+| TTFT p50 / p99 | 0.71 / 9.98 s | 0.74 / 9.09 s |
+| queue time p99 | 8.5 s | 7.0 s |
+| prefix-cache hit rate | 95.6% | 96.2% |
+
+Caveats: different windows and traffic (the v3 window was busier: concurrency p50 14 vs 8, which pushes
+latencies *up*); batch 1 never occurred and the peak was exactly 60, so neither the 3-step cap at batch 1 nor
+the 61–96 graphs were exercised. With the interleave on, `log_eval.py` shows prefill bursts capped at 10 chunks
+— the decode log fires every 40 passes and 4 run between chunks — which is itself the evidence that decode keeps
+running during a cold prefill.
+
+At 12:20 UTC all four cards lost ~3.7 GB of free memory together; GPU 0 fell to 380 MiB and the image
+pre-processor started failing (incident 16). Rolled back to v2 at 13:43 UTC.

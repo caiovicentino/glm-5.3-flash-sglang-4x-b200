@@ -1,17 +1,29 @@
 #!/usr/bin/env bash
 # GLM-5.3-Flash-NVFP4 (RadixArk) on 4x NVIDIA B200 (SM100) with SGLang.
-# The official SGLang cookbook recipe for GLM-5.3-Flash on Blackwell (nvfp4 weights, fp8 KV, trtllm DSA
-# kernels, EAGLE/MTP speculation) plus: adaptive speculation with one candidate per batch bucket,
-# multimodal, reasoning/tool parsers, metrics, cache report and 8192-token prefill chunks.
-# Usage: API_KEY=... MODEL_PATH=/root/model-glm53-radix bash serve/serve.sh
-# Env knobs: TP (4) CONC (128) CONTEXT_LENGTH (262144) CHUNK (8192) MEMF (0.85) DSA (trtllm) KVDT (fp8_e4m3)
-#            MOE (flashinfer_cutlass) ADAPTIVE_SPEC (./adaptive_spec.json) SPEC_ARGS EXTRA_ARGS PORT (8000)
+#
+#   API_KEY=... bash serve/serve.sh                  # production profile (v2)
+#   PROFILE=v3.1 API_KEY=... bash serve/serve.sh     # any profile in serve/profiles/
+#
+# Profiles: v2 = production · v3 = tried 2026-09-23 and rolled back · v3.1 = v3 + image pre-processing on CPU.
+# A profile sets the knobs below; to change one on top of a profile, copy the profile or use EXTRA_ARGS.
+#
+# Knobs: TP (4) EP (4) CONTEXT_LENGTH (524288) MEMF (0.75) CHUNK (4096) CONC (60, decode CUDA-graph ceiling)
+#        MAXREQ (96) DSA (trtllm) KVDT (fp8_e4m3) MOE (flashinfer_cutlass) ADAPTIVE_SPEC (adaptive_spec.json)
+#        SPEC_ARGS  MAMBA_SLOTS (--max-mamba-cache-size; unset = derived from MEMF)
+#        PDI (--prefill-decode-interval; unset = 0)  IMAGE_PROC (--image-processor-backend auto|torchvision|pil)
+#        EXTRA_ARGS  PORT (8000)  MODEL_PATH  SERVED_MODEL_NAME
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -n "${PROFILE:-}" ]; then
+  P="$HERE/profiles/$PROFILE.env"
+  [ -f "$P" ] || { echo "no such profile: $P" >&2; exit 1; }
+  set -a; . "$P"; set +a
+fi
 MODEL_PATH="${MODEL_PATH:-/root/model-glm53-radix}"
 KEY="${API_KEY:-$(cat /root/.api_key 2>/dev/null || true)}"
-[ -n "$KEY" ] || { echo "API_KEY not set (export API_KEY=... or write /root/.api_key)"; exit 1; }
-CONC="${CONC:-60}"          # CUDA-graph ceiling; see incident 9
+[ -n "$KEY" ] || { echo "API_KEY not set (export API_KEY=... or write /root/.api_key)" >&2; exit 1; }
+SPEC_FILE="${ADAPTIVE_SPEC:-adaptive_spec.json}"
+case "$SPEC_FILE" in /*) ;; *) SPEC_FILE="$HERE/$SPEC_FILE" ;; esac
 
 exec python -m sglang.launch_server \
   --model-path "$MODEL_PATH" --served-model-name "${SERVED_MODEL_NAME:-glm-5.3-flash}" \
@@ -22,10 +34,13 @@ exec python -m sglang.launch_server \
   --kv-cache-dtype "${KVDT:-fp8_e4m3}" \
   --moe-runner-backend "${MOE:-flashinfer_cutlass}" \
   ${SPEC_ARGS---speculative-algorithm EAGLE --speculative-num-steps 5 --speculative-eagle-topk 1 --speculative-num-draft-tokens 6 --speculative-adaptive} \
-  --speculative-adaptive-config "${ADAPTIVE_SPEC:-$HERE/adaptive_spec.json}" \
+  --speculative-adaptive-config "$SPEC_FILE" \
   --reasoning-parser glm45 --tool-call-parser glm47 \
   --mem-fraction-static "${MEMF:-0.75}" \
-  --cuda-graph-max-bs-decode "$CONC" --max-running-requests "${MAXREQ:-96}" \
+  --cuda-graph-max-bs-decode "${CONC:-60}" --max-running-requests "${MAXREQ:-96}" \
   --chunked-prefill-size "${CHUNK:-4096}" --max-prefill-tokens "${CHUNK:-4096}" \
+  ${MAMBA_SLOTS:+--max-mamba-cache-size "$MAMBA_SLOTS"} \
+  ${PDI:+--prefill-decode-interval "$PDI"} \
+  ${IMAGE_PROC:+--image-processor-backend "$IMAGE_PROC"} \
   --enable-cache-report --enable-multimodal --enable-metrics --media-url-max-file-size-mb 1024 \
   ${EXTRA_ARGS:-} --api-key "$KEY" --host 0.0.0.0 --port "${PORT:-8000}"

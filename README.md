@@ -1,148 +1,210 @@
 # GLM-5.3-Flash-NVFP4 on 4× NVIDIA B200 with SGLang
 
-The recipe we validated on 2026-09-11/12 for serving **GLM-5.3-Flash-NVFP4** (320B total / 18B active,
-vision, DSA sparse attention, MTP speculative decoding) on **four B200** (SM100, 183 GB each, NVLink)
-with SGLang, tuned for **high concurrency**: 64 to 128 simultaneous streams. It is the third box in
-a series measured with the same scripts:
+Production recipe and field notes for serving **GLM-5.3-Flash-NVFP4** (320B total / 18B active; DSA sparse
+attention + KDA linear attention; vision; MTP speculative decoding) on **four B200** with SGLang, for a real
+community workload: **80–124k requests/day of agentic coding traffic, 88k-token average prompts, 95.6% of prompt
+tokens served from the prefix cache.**
 
-- [glm-5.3-flash-sglang-4x-rtx-pro-6000](https://github.com/caiovicentino/glm-5.3-flash-sglang-4x-rtx-pro-6000) — production, SM120, PCIe
-- [glm-5.3-flash-sglang-2x-b200](https://github.com/caiovicentino/glm-5.3-flash-sglang-2x-b200) — 2× B200, TP2
-- this repo — 4× B200, TP4
+Almost every number here comes from production logs rather than synthetic benchmarks, and the repo keeps the
+changes we rolled back next to the ones we kept.
 
-Short version: **up to 24 streams, 4× B200 in TP4 is no faster than 2× B200 in TP2** (per-step latency
-bound, same ~2.4k tok/s aggregate). The four cards pay off above 48 streams: **4.9k tok/s at 64
-streams and 6.0k tok/s at 96**, 11× the ceiling of the SM120 production box, with a 7–10 M-token
-fp8 KV pool. The one change that unlocks it is the adaptive-speculation config with one candidate per
-batch bucket (`serve/adaptive_spec.json`): the stock adaptive policy switches drafting off at batch
-64 and loses 40 %.
+> **Status — 2026-09-23**
+> - **Production: v2.** TP4/EP4, 524k context, `MEMF 0.75`, decode CUDA graphs to 60, adaptive MTP (5/3/2
+>   steps by batch). Stable since 2026-09-19.
+> - **v3 was tried for 9 hours and rolled back.** It removed the decode stalls caused by cold prefills (0 per day
+>   vs ~817) and cut p99 inter-token latency from 135 to 54 ms (different windows; caveats in
+>   [`docs/results.md`](docs/results.md)) — then, at peak, the image pre-processor ran out
+>   of memory on GPU 0 and 56 image requests failed ([incident 16](docs/incidents.md)).
+> - **v3.1 is prepared, not deployed:** v3 + `--image-processor-backend pil`, which moves image pre-processing
+>   to the CPU (same tensors, max abs diff < 5e-4).
 
-## Recipe card
-
-| | |
-|---|---|
-| hardware | 4× B200 183 GB, NVLink NV18 all-to-all, Xeon Platinum 8559C 192 vCPU, 2 TB RAM, 1 TB NVMe — a Vast.ai verified-datacenter offer at ~US$ 28/h |
-| image | `lmsysorg/sglang:glm-5.3-flash` (SGLang `0.0.0.dev1+gfe236ea6c3.mmfix1`, flashinfer 0.6.17, torch 2.13+cu130, driver 595). Launch the instance from this image; nothing else to install |
-| checkpoint | [`RadixArk/GLM-5.3-Flash-NVFP4`](https://huggingface.co/RadixArk/GLM-5.3-Flash-NVFP4) (190 GB, ModelOpt 0.46, the one the SGLang cookbook uses): routed experts + MLP NVFP4 g16, attention / router gates / embeddings / lm_head / vision tower / MTP layer BF16 |
-| patches | **none** — the cookbook checkpoint loads on the stock image. The 0xSero loader patches that the 2× B200 recipe needs break the import on this newer build and are not required |
-| chat template | the checkpoint's own (`emit_image` macro present, vision works out of the box) |
-| parallelism | `--tp-size 4 --ep-size 4` — **EP4 added 2026-09-18**; the SGLang cookbook recipe uses it and we had been running TP-only with 288 experts. See "Update" below |
-| attention | `--dsa-prefill-backend trtllm --dsa-decode-backend trtllm --kv-cache-dtype fp8_e4m3` (the Blackwell pair from the cookbook); vision tower on `fa4` (auto) |
-| MoE | `--moe-runner-backend flashinfer_cutlass` with `--quantization modelopt_fp4` |
-| speculation | `--speculative-algorithm EAGLE --speculative-num-steps 5 --speculative-eagle-topk 1 --speculative-num-draft-tokens 6 --speculative-adaptive`, config `serve/adaptive_spec.json`: 5 steps at batch 1, 3 at batch ≥ 2, 2 at batch ≥ 40 |
-| memory | `--mem-fraction-static 0.75` → KV pool **6.3 M tokens**, ~21 GiB free per card. **Do not raise this with a long context** — the DSA indexer buffer is `chunk × ctx × 4B` and comes out of the free memory, not the pool (incidents 8 and 9) |
-| prefill | `--chunked-prefill-size 4096 --max-prefill-tokens 4096` — 8192 with a long context is what killed the engine on 09-14 (incident 8) |
-| concurrency | `--max-running-requests 96 --cuda-graph-max-bs-decode 60`. Graphs to 60 cover the real traffic (largest batch seen: 41); larger batches are still accepted, they just run ungraphed |
-| context | `--context-length 524288`. Raised 2026-09-18 because production was **rejecting real requests** at 373k–390k tokens. It is not free: the indexer buffer scales with it (incident 8) |
-| client | OpenAI-compatible on :8000, `--reasoning-parser glm45 --tool-call-parser glm47`, `--enable-multimodal`, `--enable-cache-report`, `--enable-metrics` |
-
-## Update 2026-09-18/19 — EP4, 524k context, and the memory that pays for both
-
-Eight days of continuous production later, three things changed. All of them came from running the
-thing, not from benchmarking it.
-
-**Expert parallelism was missing.** We served 288 routed experts with `--tp-size 4` and no `--ep-size`,
-while the SGLang cookbook recipe for this model uses TP4/**EP4**. Adding it moved every batch bucket:
-
-| batch | TP4/EP1 (115k decode samples, 4.4 days) | **TP4/EP4 (39k samples, 13 h)** | delta |
-|---|---|---|---|
-| 1 | 291 tok/s · accept 3.16 | **412** · **4.19** | +42% |
-| 2–4 | 608 · 2.80 | **701** · 2.85 | +15% |
-| 5–8 | 941 · 2.79 | **1,133** · 2.81 | +20% |
-| 9–16 | 1,275 · 2.79 | **1,665** · 2.89 | **+31%** |
-| 17–32 | 1,783 · 2.82 | **1,999** · 2.90 | +12% |
-| 33–48 | 2,185 · 2.73 | **2,712** · 2.80 | +24% |
-
-**Read these with the caveats.** This is *production traffic*, not the controlled `bench/` runs that
-produced the rest of this repo: the two columns are different days with different prompt mixes, and the
-outer buckets are thin (83 samples at batch 1, 145 at 33–48). The two well-sampled buckets — 9–16 with
-20,826 measurements and 17–32 with 12,487 — are the ones to trust, and they show +31% and +12%.
-Acceptance also rose in every bucket, which we cannot explain: EP does not change the drafter's maths.
-It may be a second-order effect of the lower graph ceiling changing which adaptive configuration gets
-picked, or simply different content. We are reporting it, not claiming it.
-
-**Context doubled, because production was rejecting work.** 262144 was turning away real requests at
-373k–390k tokens. 524288 fixed that (**0 rejections in 13 h**), and the KV pool still holds 6.3 M tokens.
-
-**And both had to be paid for.** EP4 plus the longer context left 176 MiB free per card and started
-throwing request-level OOMs. `MEMF 0.75` bought the headroom back. Prefix-cache hit rate came back to
-**95.3%** (it was 95.5% before), so the 9% smaller pool cost essentially nothing. Full story in
-incidents 8, 9 and 10.
+Series: [4× RTX PRO 6000](https://github.com/caiovicentino/glm-5.3-flash-sglang-4x-rtx-pro-6000) (SM120, PCIe) ·
+[2× B200](https://github.com/caiovicentino/glm-5.3-flash-sglang-2x-b200) (TP2) · this repo (4× B200, TP4/EP4).
 
 ## Quick start
 
 ```bash
-# machine launched from lmsysorg/sglang:glm-5.3-flash
+# on a machine launched from lmsysorg/sglang:glm-5.3-flash
 git clone https://github.com/caiovicentino/glm-5.3-flash-sglang-4x-b200 && cd glm-5.3-flash-sglang-4x-b200
-hf download RadixArk/GLM-5.3-Flash-NVFP4 --local-dir /root/model-glm53-radix     # 190 GB
-API_KEY=$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))') MODEL_PATH=/root/model-glm53-radix bash serve/serve.sh
+hf download RadixArk/GLM-5.3-Flash-NVFP4 --local-dir /root/model-glm53-radix        # 190 GB
+export API_KEY=$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')
+bash serve/serve.sh                      # production profile (v2)
+# PROFILE=v3.1 bash serve/serve.sh       # the next candidate
+python ops/smoke.py                      # 9 mandatory checks once it answers
 ```
 
-Boot is ~5 min (weights from NVMe, then decode CUDA-graph capture up to batch 128). Warm the server
-before measuring: the first request of each new shape pays FlashInfer/TRT-LLM MoE autotune and
-DeepGEMM JIT (a 22 s prose run takes 34 s the first time; 32 streams run at 443 tok/s before warm-up
-and 1,990 after).
+Boot takes ~2–3 minutes from local NVMe (weights, then CUDA-graph capture). Warm the server before measuring:
+the first request of each new shape pays MoE autotune and JIT. **To change a running production server, use
+[`ops/swap.sh`](ops/)** — it checks the boot numbers and the smoke tests and rolls back by itself.
 
-## Measured (2026-09-11, idle server, `bench/` scripts, second run)
+## Recipe card (v2, production)
 
-| axis | 4× RTX PRO 6000 (production) | 2× B200 TP2 | **4× B200 TP4** |
+| | |
+|---|---|
+| hardware | 4× B200 (183 GB, NVLink NV18 all-to-all), Xeon Platinum 8559C, 2 TB RAM (1.35 TiB usable in the container), NVMe — a Vast.ai datacenter offer at ~US$ 28/h |
+| image | `lmsysorg/sglang:glm-5.3-flash` — SGLang `0.0.0.dev1+gfe236ea6c3.mmfix1`, flashinfer 0.6.17, torch 2.13 + cu130, driver 595. Nothing else to install |
+| checkpoint | [`RadixArk/GLM-5.3-Flash-NVFP4`](https://huggingface.co/RadixArk/GLM-5.3-Flash-NVFP4) (190 GB, the cookbook's): routed experts + MLPs NVFP4, attention / router / embeddings / lm_head / vision / MTP layer BF16. `nvidia/GLM-5.3-Flash-NVFP4` does not load on this image (incident 1) |
+| parallelism | `--tp-size 4 --ep-size 4` (EP4 since 2026-09-18: +12% to +31% in the well-sampled batch buckets) |
+| attention | `--dsa-prefill-backend trtllm --dsa-decode-backend trtllm --kv-cache-dtype fp8_e4m3` |
+| MoE | `--moe-runner-backend flashinfer_cutlass --quantization modelopt_fp4` |
+| speculation | EAGLE/MTP 5 steps, top-k 1, 6 draft tokens, `--speculative-adaptive` with [`serve/adaptive_spec.json`](serve/adaptive_spec.json): 5 steps at batch 1, 3 at batch ≥ 2, 2 at batch ≥ 40. Production acceptance 2.3–3.4 (lower at high batch) |
+| memory | `--mem-fraction-static 0.75` → KV pool **6.33 M tokens**, **36.7 GB free per card after graph capture**. Do not raise it with a long context: the DSA indexer buffer (`chunk × context × 4 B` = 8 GiB here) comes out of free memory (incident 11). Full breakdown in [`docs/memory-budget.md`](docs/memory-budget.md) |
+| prefill | `--chunked-prefill-size 4096 --max-prefill-tokens 4096` (~21k tok/s cold) |
+| concurrency | `--max-running-requests 96 --cuda-graph-max-bs-decode 60`. **Known weak spot:** batches of 61–96 run without a graph at 174 ms per step, ~13 tok/s per user (incident 14) |
+| context | `--context-length 524288` — raised from 262k because production was rejecting real 373k–390k-token requests |
+| API | OpenAI-compatible on :8000, `--reasoning-parser glm45 --tool-call-parser glm47 --enable-multimodal --enable-cache-report --enable-metrics` |
+
+## Profiles
+
+`serve/serve.sh` reads a profile from [`serve/profiles/`](serve/profiles) with `PROFILE=…`:
+
+| | **v2** — production | v3 — rolled back | **v3.1** — next |
 |---|---|---|---|
-| pt-BR prose, 1 request (`prose_speed.py`) | ~100 tok/s | 215 | **218–228** |
-| code, 1 request (`code_speed.py`; server log at batch 1) | 167–197 | 261–284 | 222 (log 271–291; real traffic today shows up to 320 at acceptance 3.9) |
-| 8 streams × 400 tokens (`concurrency.py 8 400`) | 472–508 | 1,117 | **1,195** |
-| 16 streams | — | 1,773 | 1,760 |
-| 24 streams | 542 (its ceiling) | 2,420 | 2,377 |
-| 48 streams | — | — | **3,890** |
-| 64 streams | — | — | **4,850–4,910** (76 tok/s per stream, acceptance 2.38) |
-| 96 streams | — | — | **6,030–6,060** (63 per stream, the sweet spot) |
-| 128 streams | — | — | 5,370–5,420 (42 per stream; ~122 in flight, queue ≤ 6) |
-| warm prefill, 27k-token prompt | 8.1–8.4k tok/s | 22–26k | **29k tok/s** (0.92 s) |
-| KV pool (fp8) | 1.85 M tokens | 4.9 M | 7.2–9.8 M |
+| decode CUDA graphs up to | 60 | 96 | 96 |
+| max running requests | 96 | 96 | 96 |
+| MTP steps by batch | 5 @1 · 3 @2–39 · 2 @≥40 | 3 @1–39 · 2 @≥40 | same as v3 |
+| KDA state slots | 519 (derived) | 700 | 700 |
+| decode rounds between prefill chunks | 0 | 4 | 4 |
+| image pre-processing | `cuda:0`, HTTP process | `cuda:0`, HTTP process | **CPU (PIL)** |
+| KV pool | 6.33 M tokens | 6.39 M | 6.39 M |
+| KDA verify snapshots per GPU | 19.89 GB | 13.26 GB | 13.26 GB |
+| free per card after graph capture | 36.70 GB | 37.74 GB | ≈ v3 |
 
-Details, including the stock-adaptive vs per-bucket comparison at 32–64 streams, in
-[`docs/results.md`](docs/results.md). Functional gates (`bench/gates.py`): API, tool calling, thinking
-on/off, vision (three images), prefix-cache report and 8-stream concurrency pass; the three that
-fail are the known false negatives described there.
+v3 gets graphs to 96 *and* more KDA slots at no cost in KV pool. The trick is capping MTP at 3 steps: the KDA
+verify-snapshot buffer is sized by `(max running + 1) × max draft tokens × 34.2 MB`, and the 5-step candidate —
+used only at batch 1, 3.6% of the time — was making every request slot pay for 6 snapshots.
 
-## What to take from it
+## What we learned from 99 hours of production (v2)
 
-- **TP4 does not beat TP2 at low concurrency.** Both are bound by per-step latency (~30 ms per decode
-  step with speculation); splitting the same 18B-active forward over four cards saves no time. Use
-  four B200 for ≥ 48 streams, or run two TP2 replicas behind a router for ≈ 2× the low-concurrency
-  aggregate.
-- **Pin the speculation policy per batch bucket.** The stock adaptive policy measures acceptance and
-  drops the draft at high batch (acceptance 1.0 at batch 64 → 2.6–3.2k tok/s). Holding 2 draft steps
-  from batch 40 up keeps acceptance at 2.4 and gives 4.9k. Same lesson as on the SM120 box.
-- **96 streams is the ceiling, not 128.** 128 fits (no OOM at 169–181 GB per card) but aggregate
-  throughput drops because the prefill of incoming requests competes with decode.
-- **Use the cookbook checkpoint.** `nvidia/GLM-5.3-Flash-NVFP4` does not load on this image (see
-  incidents); `RadixArk/GLM-5.3-Flash-NVFP4` loads with no patches and its chat template has vision.
+Full numbers: [`docs/results.md`](docs/results.md), phase 6.
+
+- **The box is latency-bound, not throughput-bound.** A queue formed in 18 of 371,931 decode samples.
+  Concurrency p50 8, p99 35. At batch 27 each card draws ~600 of 1,000 W with the memory controller 26% busy.
+  Step time barely grows between batch 36 and 53, so aggregate throughput scales almost linearly to the ~96 knee.
+- **Per-user speed:** 306 tok/s at batch 1, 213 at 2–4, 168 at 5–8, 132 at 9–16, 102 at 17–32.
+- **Cold prefills stalled decode for everyone** — 207 min/day, 817 stalls/day of ≥ 5 s with ≥ 5 users waiting,
+  worst 25 s — because SGLang runs prefill chunks ahead of decode. `--prefill-decode-interval 4` (v3) turned
+  those stalls into slowdowns: **0 in nine hours**. `--enable-mixed-chunk`, which batches prefill chunks
+  *with* decode, is also accepted with EAGLE on this build — untested so far (see v3.1 below).
+- **A TTFT floor of ~0.5 s lives in the single Python front-end**, growing to ~1–1.8 s with 34 running. The fix
+  (`--tokenizer-worker-num`) is incompatible with `--api-key` (incident 15).
+- **Both cache pools are full.** KV: 15 k of 6.33 M tokens free. KDA state: 3 of 519 slots free. A session is
+  reusable only while both its KV and a KDA checkpoint survive, and ~1,000 requests/day compute ≥ 100k cold
+  tokens. The structural fix — HiCache in host RAM — is blocked upstream for KDA models
+  ([sglang#33713](https://github.com/sgl-project/sglang/issues/33713)).
+- **The fastest lever is not in the server.** The chat template defaults to `reasoning_effort: max` (800–1,000
+  reasoning tokens even on trivial turns), and agent harnesses that resend old reasoning degenerate over long
+  sessions — see Pitfalls.
+
+## Memory, in one paragraph
+
+Per GPU: 44.8 GB of weights, 3.8 GB of MTP layer, **~39 GB of KDA state** (of which 19.9 GB are verify
+snapshots in v2), ~46 GB of KV (target + draft), then CUDA graphs and ~37 GB free for dynamic buffers.
+`--mem-fraction-static` moves memory between the static pools and free memory; `--max-running-requests`,
+the MTP draft length and `--max-mamba-cache-size` are paid from the static budget, i.e. from the KV pool; CUDA
+graphs and the DSA indexer buffer are paid from free memory. An earlier version of this README had the graph
+part backwards — details and the correction in [`docs/memory-budget.md`](docs/memory-budget.md).
+
+## v3.1 — prepared, deploy with a rollback armed
+
+```bash
+NEW=v3.1 OLD=v2 MAMBA_SLOTS_EXPECT=700 SMOKE_IMAGE_CPU=1 \
+SMOKE_EXPECT="prefill_decode_interval=4,cuda_graph_max_bs_decode=96,max_mamba_cache_size=700,image_processor_backend=pil" \
+  setsid nohup bash ops/swap.sh >/dev/null 2>&1 </dev/null &
+```
+
+What to watch in the first 24 h: `OutOfMemoryError` in the server log (should stay 0), the HTTP process's GPU
+memory after image traffic (should not grow), stalls ≥ 5 s (should stay 0), batch 61–96 per-user speed (no
+longer 13 tok/s) and batch-1 speed (306 tok/s in v2 with 5 MTP steps; expected within a few percent with 3).
+Image pre-processing on the CPU costs 5–63 ms per image; agent sessions that resend many screenshots every turn
+will feel that in TTFT.
+
+**After v3.1: `--enable-mixed-chunk`.** Older SGLang builds refused mixed chunked prefill with speculative
+decoding; this one allows it for EAGLE (`SpeculativeAlgorithm.supports_mixed_chunk`), and a dry parse with the v3.1
+flags keeps `enable_mixed_chunk=True`. It would let decode continue *inside* the prefill batches instead of
+between them. Not yet validated with KDA state and DSA — one change at a time, after v3.1 has a clean 24 h.
+
+## Checked and ruled out
+
+Several flags exist, parse and boot, and do nothing for this model. Details and evidence in
+[`docs/ruled-out.md`](docs/ruled-out.md):
+
+- `--enable-linear-replayssm-spec` would free the KDA verify snapshots but only activates for Qwen3-Next-style
+  GDN and Kimi-Linear configs — inert for `Glm5NextForConditionalGeneration`.
+- HiCache: blocked by sglang#33713 for KDA models. `--enable-int8-mamba-checkpoint` is the alternative, but it
+  excludes HiCache and draws on free memory.
+- DP attention: no session-affinity dispatch in this build, and MTP + DP attention is not validated on this model.
+- Prefill CUDA graphs are disabled for KDA; FlashInfer allreduce fusion is not wired for this architecture.
+- Beyond ~96 concurrent requests, per-user speed drops without any gain in total throughput.
+
+## Idle-server benchmark (2026-09-11, `bench/` scripts, second run, TP4 before EP4)
+
+| axis | 4× RTX PRO 6000 | 2× B200 TP2 | **4× B200 TP4** |
+|---|---|---|---|
+| pt-BR prose, 1 request | ~100 tok/s | 215 | **218–228** |
+| code, 1 request | 167–197 | 261–284 | 222 (log 271–291) |
+| 8 / 16 / 24 streams | 472–508 / — / 542 | 1,117 / 1,773 / 2,420 | 1,195 / 1,760 / 2,377 |
+| 48 / 64 streams | — | — | 3,890 / **4,850–4,910** |
+| 96 streams | — | — | **6,030–6,060** (63 per stream — the knee) |
+| 128 streams | — | — | 5,370–5,420 (42 per stream) |
+| warm prefill, 27k-token prompt | 8.1–8.4k tok/s | 22–26k | **29k** |
+
+Up to 24 streams, four B200 in TP4 are no faster than two in TP2 (both per-step-latency bound); the four cards
+pay off above ~48 streams. The per-bucket speculation config is what makes 64+ streams work: the stock adaptive
+policy drops drafting at batch 64 and loses ~40%.
+
+## EP4 (2026-09-18/19)
+
+| batch | TP4/EP1 (115k samples, 4.4 days) | TP4/EP4 (39k samples, 13 h) | delta |
+|---|---|---|---|
+| 1 | 291 tok/s · accept 3.16 | 412 · 4.19 | +42% |
+| 2–4 | 608 · 2.80 | 701 · 2.85 | +15% |
+| 5–8 | 941 · 2.79 | 1,133 · 2.81 | +20% |
+| **9–16** | 1,275 · 2.79 | **1,665** · 2.89 | **+31%** |
+| **17–32** | 1,783 · 2.82 | **1,999** · 2.90 | **+12%** |
+| 33–48 | 2,185 · 2.73 | 2,712 · 2.80 | +24% |
+
+Production traffic on different days: trust the two well-sampled buckets (9–16: 20,826 samples; 17–32: 12,487).
+EP disables shared-experts fusion (incident 13); it was still a clear win. The longer context and EP4 together
+cost the memory headroom that `MEMF 0.75` bought back (incident 12).
+
+## Pitfalls
+
+- **Agent harnesses: send `clear_thinking: true`.** The template defaults to keeping previous reasoning in the
+  context. In one 11-hour agent session, reasoning degenerated into `o o o o:` filler after ~750 clean turns
+  and then fed on itself. With six degenerate reasoning blocks in the history, 6 of 12 generations degenerated
+  without `clear_thinking` and 0 of 12 with it (it also shrinks long contexts).
+- **Never `enable_thinking: false` to save tokens** — the plan leaks into `content`. Use `reasoning_effort: low` or
+  `high` instead (1 and 16 reasoning tokens on a simple question, against ~800 at the default `max`).
+- **`/get_server_info` and the `server_args=` line at startup print `--api-key` in plain text.** Filter both
+  before sharing logs or dumps.
+- **`--tokenizer-worker-num > 1` is incompatible with `--api-key`**, and a dry parse does not tell you.
+- **The HTTP process pre-processes images on `cuda:0`** unless `--image-processor-backend pil`; keep headroom on
+  GPU 0 or move it to the CPU.
+- **Above `--cuda-graph-max-bs-decode`, requests are not refused, they run ~4.6× slower.** Keep
+  `--max-running-requests` ≤ the graph ceiling unless you have measured the ungraphed speed.
+- **Adaptive-spec format:** `{"1": {"candidate_steps": [5], "up_hysteresis": 0.0, "down_hysteresis": 0.0,
+  "ceiling_coeff": 0}, …}`. The short form `{"1": [5]}` crashes the scheduler.
 - `--enable-cache-report` is what makes `usage.prompt_tokens_details.cached_tokens` non-zero.
-
-## Pitfalls we hit (so you don't)
-
-- **`nvidia/GLM-5.3-Flash-NVFP4` fails at load**: `model.layers.11.self_attn.kv_b_proj.weight` arrives
-  BF16 `[32768, 512]` while the loader created an FP4 parameter `[8192, 256]`; the checkpoint's
-  exclusion list is written with the `model.language_model.` prefix and does not match. Use RadixArk.
-- **Do not apply the 0xSero loader patches here**: on build `fe236ea6c3` they fail at import
-  (`is_blackwell_supported` no longer lives in `fp8_utils`). They are for the older build.
-- **Adaptive spec format**: `{"1": {"candidate_steps": [5], "up_hysteresis": 0.0, "down_hysteresis":
-  0.0, "ceiling_coeff": 0}, ...}`. The short form `{"1": [5]}` crashes the scheduler.
-- **Default `reasoning_effort` is `max`** on this template: 6–8k reasoning tokens on an essay prompt.
-  Send `reasoning_effort: high` (or `low`) from the client.
-- **Vast.ai team instances and SSH**: the key must be registered on the *owner* account and, in our
-  case, also written by the on-start command (`authorized_keys2` + `AuthorizedKeysFile` in
-  `sshd_config.d`); the API's attach-ssh and the console button were not enough.
+- Do not apply the 0xSero loader patches on this build; use the RadixArk checkpoint instead of NVIDIA's.
+- Vast.ai team instances: see incident 9 for SSH.
 
 ## Layout
 
 ```
-serve/serve.sh            launch script (all flags above, env-overridable)
-serve/adaptive_spec.json  per-bucket speculation config (1→5, ≥2→3, ≥40→2 steps)
-serve/env.example         API_KEY / MODEL_PATH / CONC
-bench/                    prose, code, concurrency, TTFT, gates, per-batch log parser (see bench/README.md)
-docs/results.md           every number, per run
-docs/incidents.md         what broke, in order, and the fix
+serve/serve.sh               launch script — knobs via env, PROFILE=v2|v3|v3.1
+serve/profiles/*.env         the three profiles above
+serve/adaptive_spec*.json    per-bucket speculation (v2: 1→5, 2→3, 40→2 · v3: 1→3, 40→2)
+ops/swap.sh                  production swap with memory guard, smoke tests and automatic rollback
+ops/smoke.py                 post-boot checks (models, reasoning, streaming, tools, vision, cache, images off GPU…)
+tools/log_eval.py            per-bucket decode speed, acceptance, ms/step, queueing and prefill stalls from logs
+tools/metrics_summary.py     TTFT / inter-token / queue percentiles and per-request sizes from /metrics
+bench/                       idle-server benchmarks (prose, code, concurrency, TTFT, gates)
+docs/results.md              every number, by phase
+docs/incidents.md            what broke, in order, and the fix
+docs/memory-budget.md        per-GPU memory, and what each knob costs
+docs/ruled-out.md            what we checked and why it does not apply
 ```
 
-MIT. Measurements by CulturaBuilder; the SGLang cookbook page for GLM-5.3-Flash is the upstream
-reference for the base flags.
+MIT. Measurements by CulturaBuilder. The SGLang cookbook page for GLM-5.3-Flash is the upstream reference for
+the base flags.

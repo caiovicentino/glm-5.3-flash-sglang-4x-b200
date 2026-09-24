@@ -152,17 +152,23 @@ Profile `serve/profiles/v3.env`: graphs to 96, MTP capped at 3 steps, 700 KDA sl
 prefill chunks. Boot: KV 6,389,760 tokens, KDA verify snapshots 13.26 GB (19.89 in v2), **37.74 GB free after
 graph capture** (36.70 in v2). Nine mandatory smoke tests passed. First 8 hours (04:30 → 12:31, 36k requests):
 
-| | v2 (first 3.6 days) | v3 (8 h) |
-|---|---|---|
-| stalls ≥ 5 s with ≥ 5 users decoding | ~817/day | **0** |
-| inter-token latency p50 / p99 | 4.5 / 135 ms | 7.2 / **54 ms** |
-| per request, batch 9–16 / 17–32 | 132 / 102 tok/s | 139 / 107 tok/s |
-| TTFT p50 / p99 | 0.71 / 9.98 s | 0.74 / 9.09 s |
-| queue time p99 | 8.5 s | 7.0 s |
-| prefix-cache hit rate | 95.6% | 96.2% |
+| | v2, first 3.6 days | **v3, 8 h** | v2 again, 12.4 h after the rollback |
+|---|---|---|---|
+| window | 2026-09-19 → 22 | 2026-09-23 04:30 → 12:31 | 2026-09-23 13:46 → 09-24 02:08 |
+| concurrency p50 | 8 | 14 | 19 |
+| **stalls ≥ 5 s with ≥ 5 users decoding** | ~817/day | **0** | **497/day** |
+| inter-token latency p50 / p99 | 4.5 / 135 ms | 7.2 / 54 ms | 7.5 / 58 ms |
+| per request, batch 9–16 / 17–32 | 132 / 102 tok/s | 139 / 107 | 145 / 114 |
+| TTFT p50 / p99 | 0.71 / 9.98 s | 0.74 / 9.09 s | 0.86 / 8.30 s |
+| queue time p99 | 8.5 s | 7.0 s | 4.8 s |
+| prefix-cache hit rate | 95.6% | 96.2% | 95.9% |
 
-Caveats: different windows and traffic (the v3 window was busier: concurrency p50 14 vs 8, which pushes
-latencies *up*); batch 1 never occurred and the peak was exactly 60, so neither the 3-step cap at batch 1 nor
+**What survives the like-for-like comparison is only the stall elimination.** The v2 run right after the rollback
+saw similar traffic and still stalled 497 times a day; v3 stalled zero times. The p99 inter-token latency, the
+per-request speed and TTFT move with the traffic mix, not with v3 — an earlier version of this page credited v3
+with cutting p99 inter-token latency from 135 to 54 ms, and the third column shows that was the traffic.
+
+Other caveats: batch 1 never occurred and the peak was exactly 60, so neither the 3-step cap at batch 1 nor
 the 61–96 graphs were exercised. With the interleave on, `log_eval.py` shows prefill bursts capped at 10 chunks
 — the decode log fires every 40 passes and 4 run between chunks — which is itself the evidence that decode keeps
 running during a cold prefill.

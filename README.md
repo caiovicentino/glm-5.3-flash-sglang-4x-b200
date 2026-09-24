@@ -11,10 +11,10 @@ changes we rolled back next to the ones we kept.
 > **Status — 2026-09-23**
 > - **Production: v2.** TP4/EP4, 524k context, `MEMF 0.75`, decode CUDA graphs to 60, adaptive MTP (5/3/2
 >   steps by batch). Stable since 2026-09-19.
-> - **v3 was tried for 9 hours and rolled back.** It removed the decode stalls caused by cold prefills (0 per day
->   vs ~817) and cut p99 inter-token latency from 135 to 54 ms (different windows; caveats in
->   [`docs/results.md`](docs/results.md)) — then, at peak, the image pre-processor ran out
->   of memory on GPU 0 and 56 image requests failed ([incident 16](docs/incidents.md)).
+> - **v3 was tried for 9 hours and rolled back.** It removed the long decode stalls caused by cold prefills (0 in
+>   8 hours, against 497/day for v2 under similar traffic the same day) — then, at peak, the image pre-processor
+>   ran out of memory on GPU 0 and 56 image requests failed ([incident 16](docs/incidents.md)). Its other
+>   apparent gains were traffic, not v3 ([`docs/results.md`](docs/results.md), phase 7).
 > - **v3.1 is prepared, not deployed:** v3 + `--image-processor-backend pil`, which moves image pre-processing
 >   to the CPU (same tensors, max abs diff < 5e-4).
 

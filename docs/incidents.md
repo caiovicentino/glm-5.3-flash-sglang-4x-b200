@@ -80,5 +80,8 @@ the original text had the mechanism wrong; see [`memory-budget.md`](memory-budge
     step left GPU 0 with 380 MiB. Result: **56 `OutOfMemoryError`, all in
     `image_processing_glm5_next.py::_preprocess`** (a 298 MiB `torch.cat`) — only requests carrying images failed;
     inference itself logged a single allocator warning in nine hours. Rolled back to v2 at 13:43 UTC (2 min 16 s
-    down). Fix prepared as v3.1: `--image-processor-backend pil`, which makes SGLang skip the device entirely;
-    the PIL processor produces the same tensors (max abs diff < 5e-4) at 5–63 ms of CPU per image.
+    down). **Not a v3 problem:** back on v2, the same failure hit on 2026-09-24/25 once GPU 0 lost its accidental
+    headroom — 172 image OOMs, up to ~56 an hour, all in `_preprocess`. Fix, in production since 2026-09-26 as
+    v3.1: `--image-processor-backend pil`, which makes SGLang skip the device entirely; the PIL processor produces
+    the same tensors (max abs diff < 5e-4) at 5–63 ms of CPU per image, and the HTTP process now holds no GPU
+    memory at all.

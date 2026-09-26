@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # GLM-5.3-Flash-NVFP4 (RadixArk) on 4x NVIDIA B200 (SM100) with SGLang.
 #
-#   API_KEY=... bash serve/serve.sh                  # production profile (v2)
-#   PROFILE=v3.1 API_KEY=... bash serve/serve.sh     # any profile in serve/profiles/
+#   API_KEY=... bash serve/serve.sh                  # production profile (v3.1)
+#   PROFILE=v2 API_KEY=... bash serve/serve.sh       # any profile in serve/profiles/; PROFILE=none = built-in defaults
 #
-# Profiles: v2 = production · v3 = tried 2026-09-23 and rolled back · v3.1 = v3 + image pre-processing on CPU.
+# Profiles: v3.1 = production · v2 = previous, fallback · v3 = tried 2026-09-23 and rolled back.
 # A profile sets the knobs below; to change one on top of a profile, copy the profile or use EXTRA_ARGS.
 #
 # Knobs: TP (4) EP (4) CONTEXT_LENGTH (524288) MEMF (0.75) CHUNK (4096) CONC (60, decode CUDA-graph ceiling)
@@ -14,7 +14,8 @@
 #        EXTRA_ARGS  PORT (8000)  MODEL_PATH  SERVED_MODEL_NAME
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [ -n "${PROFILE:-}" ]; then
+PROFILE="${PROFILE:-v3.1}"
+if [ "$PROFILE" != "none" ]; then
   P="$HERE/profiles/$PROFILE.env"
   [ -f "$P" ] || { echo "no such profile: $P" >&2; exit 1; }
   set -a; . "$P"; set +a

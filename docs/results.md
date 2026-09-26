@@ -1,7 +1,7 @@
 # Results — 4× B200
 
-Phases 1–5: controlled runs and the first production days (2026-09-11 → 19). Phases 6–7: the production eval
-of v2 and the v3 trial (2026-09-22 → 23), measured from real traffic with `tools/log_eval.py` and
+Phases 1–5: controlled runs and the first production days (2026-09-11 → 19). Phases 6–8: the production eval
+of v2, the v3 trial and v3.1 in production (2026-09-22 → 26), measured from real traffic with `tools/log_eval.py` and
 `tools/metrics_summary.py`.
 
 ## Phases 1–5 — 4× B200 TP4, 2026-09-11 (14:00–18:30 UTC−3) → 2026-09-19
@@ -175,3 +175,24 @@ running during a cold prefill.
 
 At 12:20 UTC all four cards lost ~3.7 GB of free memory together; GPU 0 fell to 380 MiB and the image
 pre-processor started failing (incident 16). Rolled back to v2 at 13:43 UTC.
+
+## Phase 8 — v3.1 in production, from 2026-09-26 04:03 UTC
+
+Profile `serve/profiles/v3.1.env` (v3 + `--image-processor-backend pil`), deployed by a scheduled swap with a
+rollback chain. Boot: KV 6,389,760 tokens, 700 KDA slots, 37.74 GB free after graph capture; 12/12 smoke tests.
+Compared with v2 **in the same week** (2026-09-23 13:46 → 25 13:05), which is the fair control — the traffic
+changed a lot after 2026-09-22 (an internal batch job with short prompts and long outputs is now a large share):
+
+| | v2, 47 h (same week) | **v3.1, first 9.1 h** |
+|---|---|---|
+| **stalls ≥ 5 s with ≥ 5 users decoding** | **463/day** | **0/day** |
+| image pre-processing `OutOfMemoryError` | 172 (24–25/09, GPU 0 down to 1.5 GB free) | **0** — the HTTP process holds no GPU memory |
+| per request, batch 9–16 / 17–32 | 145 / 114 tok/s | 144 / 111 tok/s |
+| inter-token latency p50 / p99 | 7.6 / 53 ms | 6.5 / 45 ms |
+| TTFT p50 / p99 | 0.85 / 7.8 s | 0.79 / 10.7 s |
+| prefix-cache hit rate | 95.6% | 96.4% |
+| concurrency p50 / max | 20 / 56 | 12 / 57 |
+
+The stall and OOM rows are the changes that matter; per-user decode speed is the same, as expected — nothing in
+v3.1 touches the decode kernels. Cold prefill runs ~12% slower per chunk (0.222 vs 0.194 s) because decode rounds
+now run between chunks, and the TTFT tail moves with it. Not yet exercised: batch 1 and batches above 60.

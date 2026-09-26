@@ -8,15 +8,15 @@ tokens served from the prefix cache.**
 Almost every number here comes from production logs rather than synthetic benchmarks, and the repo keeps the
 changes we rolled back next to the ones we kept.
 
-> **Status — 2026-09-23**
-> - **Production: v2.** TP4/EP4, 524k context, `MEMF 0.75`, decode CUDA graphs to 60, adaptive MTP (5/3/2
->   steps by batch). Stable since 2026-09-19.
-> - **v3 was tried for 9 hours and rolled back.** It removed the long decode stalls caused by cold prefills (0 in
->   8 hours, against 497/day for v2 under similar traffic the same day) — then, at peak, the image pre-processor
->   ran out of memory on GPU 0 and 56 image requests failed ([incident 16](docs/incidents.md)). Its other
->   apparent gains were traffic, not v3 ([`docs/results.md`](docs/results.md), phase 7).
-> - **v3.1 is prepared, not deployed:** v3 + `--image-processor-backend pil`, which moves image pre-processing
->   to the CPU (same tensors, max abs diff < 5e-4).
+> **Status — 2026-09-26**
+> - **Production: v3.1** since 2026-09-26 04:03 UTC — TP4/EP4, 524k context, decode CUDA graphs to 96, MTP capped
+>   at 3 steps, 700 KDA state slots, 4 decode rounds between prefill chunks, image pre-processing on the CPU.
+>   Deployed by `ops/`-style swap with automatic rollback: 2 min 12 s down, 12/12 smoke tests.
+> - **First 9 hours vs v2 the same week:** long decode stalls (≥ 5 s with ≥ 5 users waiting) **0/day vs 463/day**;
+>   image pre-processing OOMs **0 vs 172** — the HTTP process no longer touches the GPU at all; per-user decode
+>   speed unchanged ([`docs/results.md`](docs/results.md), phase 8).
+> - History: v2 (2026-09-19 → 26) is the fallback profile; v3 ran 9 hours on 2026-09-23 and was rolled back for
+>   the image OOM that v3.1 fixes ([incident 16](docs/incidents.md)).
 
 Series: [4× RTX PRO 6000](https://github.com/caiovicentino/glm-5.3-flash-sglang-4x-rtx-pro-6000) (SM120, PCIe) ·
 [2× B200](https://github.com/caiovicentino/glm-5.3-flash-sglang-2x-b200) (TP2) · this repo (4× B200, TP4/EP4).
@@ -28,8 +28,8 @@ Series: [4× RTX PRO 6000](https://github.com/caiovicentino/glm-5.3-flash-sglang
 git clone https://github.com/caiovicentino/glm-5.3-flash-sglang-4x-b200 && cd glm-5.3-flash-sglang-4x-b200
 hf download RadixArk/GLM-5.3-Flash-NVFP4 --local-dir /root/model-glm53-radix        # 190 GB
 export API_KEY=$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')
-bash serve/serve.sh                      # production profile (v2)
-# PROFILE=v3.1 bash serve/serve.sh       # the next candidate
+bash serve/serve.sh                      # production profile (v3.1)
+# PROFILE=v2 bash serve/serve.sh         # the previous one, kept as fallback
 python ops/smoke.py                      # 9 mandatory checks once it answers
 ```
 
@@ -37,7 +37,7 @@ Boot takes ~2–3 minutes from local NVMe (weights, then CUDA-graph capture). Wa
 the first request of each new shape pays MoE autotune and JIT. **To change a running production server, use
 [`ops/swap.sh`](ops/)** — it checks the boot numbers and the smoke tests and rolls back by itself.
 
-## Recipe card (v2, production)
+## Recipe card (v3.1, production)
 
 | | |
 |---|---|
@@ -47,10 +47,11 @@ the first request of each new shape pays MoE autotune and JIT. **To change a run
 | parallelism | `--tp-size 4 --ep-size 4` (EP4 since 2026-09-18: +12% to +31% in the well-sampled batch buckets) |
 | attention | `--dsa-prefill-backend trtllm --dsa-decode-backend trtllm --kv-cache-dtype fp8_e4m3` |
 | MoE | `--moe-runner-backend flashinfer_cutlass --quantization modelopt_fp4` |
-| speculation | EAGLE/MTP 5 steps, top-k 1, 6 draft tokens, `--speculative-adaptive` with [`serve/adaptive_spec.json`](serve/adaptive_spec.json): 5 steps at batch 1, 3 at batch ≥ 2, 2 at batch ≥ 40. Production acceptance 2.3–3.4 (lower at high batch) |
-| memory | `--mem-fraction-static 0.75` → KV pool **6.33 M tokens**, **36.7 GB free per card after graph capture**. Do not raise it with a long context: the DSA indexer buffer (`chunk × context × 4 B` = 8 GiB here) comes out of free memory (incident 11). Full breakdown in [`docs/memory-budget.md`](docs/memory-budget.md) |
-| prefill | `--chunked-prefill-size 4096 --max-prefill-tokens 4096` (~21k tok/s cold) |
-| concurrency | `--max-running-requests 96 --cuda-graph-max-bs-decode 60`. **Known weak spot:** batches of 61–96 run without a graph at 174 ms per step, ~13 tok/s per user (incident 14) |
+| speculation | EAGLE/MTP 3 steps, top-k 1, 4 draft tokens, `--speculative-adaptive` with [`serve/adaptive_spec_v3.json`](serve/adaptive_spec_v3.json): 3 steps at batch 1–39, 2 at batch ≥ 40. Production acceptance 2.8–2.9. Capping at 3 (v2 used 5 at batch 1) shrinks the KDA verify-snapshot buffer by 6.6 GB/GPU |
+| memory | `--mem-fraction-static 0.75`, `--max-mamba-cache-size 700` → KV pool **6.39 M tokens**, 700 KDA state slots, **37.7 GB free per card after graph capture**. Do not raise MEMF with a long context: the DSA indexer buffer (`chunk × context × 4 B` = 8 GiB here) comes out of free memory (incident 11). Full breakdown in [`docs/memory-budget.md`](docs/memory-budget.md) |
+| prefill | `--chunked-prefill-size 4096 --max-prefill-tokens 4096 --prefill-decode-interval 4` (~18–21k tok/s cold; 4 decode rounds run between chunks, so running requests keep streaming during a cold prefill) |
+| concurrency | `--max-running-requests 96 --cuda-graph-max-bs-decode 96` — every batch size up to the cap has a graph (v2 stopped at 60 and fell to 13 tok/s per user above it, incident 14) |
+| images | `--image-processor-backend pil`: pre-processing on the CPU, 5–63 ms per image; the HTTP process holds no GPU memory (incident 16) |
 | context | `--context-length 524288` — raised from 262k because production was rejecting real 373k–390k-token requests |
 | API | OpenAI-compatible on :8000, `--reasoning-parser glm45 --tool-call-parser glm47 --enable-multimodal --enable-cache-report --enable-metrics` |
 
@@ -58,7 +59,7 @@ the first request of each new shape pays MoE autotune and JIT. **To change a run
 
 `serve/serve.sh` reads a profile from [`serve/profiles/`](serve/profiles) with `PROFILE=…`:
 
-| | **v2** — production | v3 — rolled back | **v3.1** — next |
+| | v2 — previous, fallback | v3 — rolled back | **v3.1** — production |
 |---|---|---|---|
 | decode CUDA graphs up to | 60 | 96 | 96 |
 | max running requests | 96 | 96 | 96 |
@@ -105,7 +106,7 @@ the MTP draft length and `--max-mamba-cache-size` are paid from the static budge
 graphs and the DSA indexer buffer are paid from free memory. An earlier version of this README had the graph
 part backwards — details and the correction in [`docs/memory-budget.md`](docs/memory-budget.md).
 
-## v3.1 — prepared, deploy with a rollback armed
+## v3.1 — how it was deployed, and how to redo it
 
 ```bash
 NEW=v3.1 OLD=v2 MAMBA_SLOTS_EXPECT=700 SMOKE_IMAGE_CPU=1 \
@@ -113,9 +114,9 @@ SMOKE_EXPECT="prefill_decode_interval=4,cuda_graph_max_bs_decode=96,max_mamba_ca
   setsid nohup bash ops/swap.sh >/dev/null 2>&1 </dev/null &
 ```
 
-What to watch in the first 24 h: `OutOfMemoryError` in the server log (should stay 0), the HTTP process's GPU
-memory after image traffic (should not grow), stalls ≥ 5 s (should stay 0), batch 61–96 per-user speed (no
-longer 13 tok/s) and batch-1 speed (306 tok/s in v2 with 5 MTP steps; expected within a few percent with 3).
+On 2026-09-26 it ran as a scheduled job at 04:00 UTC, with a rollback chain of v2 + `pil` → v2 → the original
+recipe. It came up in 2 min 12 s and passed all 12 smoke tests; the HTTP process went from 720 MiB on GPU 0 in v2
+to none at all. Still unmeasured after 9 hours: batch 1 (never occurred) and batches above 60 (peak was 57).
 Image pre-processing on the CPU costs 5–63 ms per image; agent sessions that resend many screenshots every turn
 will feel that in TTFT.
 
